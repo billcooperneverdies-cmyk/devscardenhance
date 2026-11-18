@@ -1,0 +1,796 @@
+#!/usr/bin/env python3
+"""Chained Conditional PatchGAN De-Glare + 1x ESRGAN (RaGAN) Scanner Restoration.
+
+Implements a two-stage generative adversarial restoration pipeline tailored for
+flatbed CIS/CCD scans of metallic chrome, holographic, and refractor trading cards:
+
+1. Stage 1 (De-Glare, Vertical CIS Streak & Reflection Separation):
+   - Specular-aware U-Net Generator (`DeGlareUNetGenerator`) that predicts both
+     a cleaned transmission image and a soft specular/reflection mask.
+   - Markovian PatchGAN Discriminator (`PatchGANDiscriminator`, Isola et al.,
+     CVPR 2017, https://arxiv.org/abs/1611.07004).
+   - Gradient-domain Exclusion Loss (`ExclusionLoss`, Zhang et al., CVPR 2018,
+     https://arxiv.org/abs/1806.05376) to decouple slab/scanner-glass reflection
+     edges from underlying card artwork and foil typography (Fu et al., ICCV 2021,
+     https://arxiv.org/abs/2108.06881).
+
+2. Stage 2 (1x Micro-Etching & Refractor Restoration):
+   - Batch-Norm-free Residual-in-Residual Dense Block Generator (`ESRGAN1xGenerator`,
+     Wang et al., ECCV 2018W, https://arxiv.org/abs/1809.00219) operating at 1x
+     spatial resolution to reconstruct fine diffraction lines without BN color shift.
+   - Relativistic Average GAN Discriminator & Loss (`RaGANDiscriminator`,
+     `RelativisticAverageGANLoss`, Jolicoeur-Martineau, ICLR 2019,
+     https://arxiv.org/abs/1807.00734; Real-ESRGAN, Wang et al., ICCV 2021W,
+     https://arxiv.org/abs/2107.10833) with Spectral Normalization.
+   - Pre-activation feature + high-frequency Sobel/Laplacian edge loss.
+
+3. OpenCV / Frequency-Domain Fallback & Pre-Processor (`restore_scan_cv2`):
+   - Automatically detects and inpaints vertical CIS scanner calibration streaks,
+     recovers blown specular chrome highlights via bilateral tone decomposition,
+     and suppresses high-frequency halftone/refractor moiré even when PyTorch
+     is not installed.
+"""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Optional, Tuple
+
+import cv2
+import numpy as np
+from PIL import Image
+
+try:
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    from torch.nn.utils import spectral_norm
+    from torch.utils.data import DataLoader, Dataset
+    import torchvision.transforms.functional as TF
+
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
+
+
+# ============================================================================
+# Deterministic OpenCV Pre-Processor / Fallback for CIS Streaks & Chrome Glare
+# ============================================================================
+
+
+def detect_and_remove_vertical_streaks(img_bgr: np.ndarray) -> Tuple[np.ndarray, list[int]]:
+    """Detects and repairs vertical CIS scanner calibration/dust streaks.
+
+    Flatbed CIS scanners (such as those used for trading cards) frequently
+    exhibit 1-to-3px vertical lines where a dirty calibration pixel creates a
+    persistent column anomaly across the full scan height.
+    """
+    h, w, _ = img_bgr.shape
+    img_f = img_bgr.astype(np.float32)
+
+    # Compare each column against a 7-column horizontal median reference
+    median_ref = cv2.medianBlur(img_bgr, 5).astype(np.float32)
+    col_diff = np.abs(img_f - median_ref)
+
+    # Column-wise sharp second derivative spike
+    lap_x = np.abs(
+        2.0 * img_f[:, 1:-1, :] - img_f[:, :-2, :] - img_f[:, 2:, :]
+    )
+    lap_profile = np.mean(lap_x, axis=(0, 2))
+    padded_lap = np.pad(lap_profile, 7, mode='edge')
+    windows = np.lib.stride_tricks.sliding_window_view(padded_lap, 15)
+    med_lap = np.median(windows, axis=-1)
+    spike_ratio = (lap_profile + 1e-3) / (med_lap + 1e-3)
+
+    # Identify interior columns (excluding 8% outer card border) with persistent spikes
+    margin = int(w * 0.08)
+    candidate_cols: list[int] = []
+    for x_idx in range(margin, w - margin - 2):
+        if spike_ratio[x_idx] > 1.45:
+            row_persistence = np.mean(np.max(col_diff[:, x_idx + 1, :], axis=1) > 7.0)
+            if row_persistence > 0.30:
+                candidate_cols.append(x_idx + 1)
+
+    if not candidate_cols:
+        return img_bgr, []
+
+    mask = np.zeros((h, w), dtype=np.uint8)
+    for col in candidate_cols:
+        x0 = max(0, col - 1)
+        x1 = min(w - 1, col + 1)
+        local_dev = np.max(col_diff[:, x0 : x1 + 1, :], axis=2)
+        mask[:, x0 : x1 + 1] = np.where(local_dev > 5.0, 255, mask[:, x0 : x1 + 1])
+
+    repaired = cv2.inpaint(img_bgr, mask, inpaintRadius=2, flags=cv2.INPAINT_TELEA)
+    return repaired, candidate_cols
+
+
+def restore_scan_cv2(
+    img_bgr: np.ndarray,
+    rotate_180: bool = False,
+    remove_streaks: bool = True,
+) -> Tuple[np.ndarray, Dict[str, object]]:
+    """Restores a chrome/refractor card scan using bilateral + Telea de-glare."""
+    if rotate_180:
+        img_bgr = cv2.rotate(img_bgr, cv2.ROTATE_180)
+
+    streak_cols: list[int] = []
+    if remove_streaks:
+        img_bgr, streak_cols = detect_and_remove_vertical_streaks(img_bgr)
+
+    # Convert to LAB to separate luminance (specular glare) from chrome color
+    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    l_chan, a_chan, b_chan = cv2.split(lab)
+
+    # Bilateral base/detail decomposition on luminance to preserve prism edges
+    l_base = cv2.bilateralFilter(l_chan, d=7, sigmaColor=25.0, sigmaSpace=25.0)
+    l_detail = l_chan - l_base
+
+    # Softly compress clipped specular glare peaks (> 220) while boosting micro-etching detail
+    glare_mask = np.clip((l_base - 220.0) / 35.0, 0.0, 1.0)
+    l_base_compressed = l_base - glare_mask * 12.0
+    l_restored = np.clip(l_base_compressed + 1.18 * l_detail, 0.0, 255.0)
+
+    merged_lab = cv2.merge(
+        [
+            l_restored.astype(np.uint8),
+            np.clip(a_chan, 0, 255).astype(np.uint8),
+            np.clip(b_chan, 0, 255).astype(np.uint8),
+        ]
+    )
+    restored_bgr = cv2.cvtColor(merged_lab, cv2.COLOR_LAB2BGR)
+    return restored_bgr, {'repaired_streak_columns': streak_cols, 'rotated_180': rotate_180}
+
+
+# ============================================================================
+# PyTorch Conditional PatchGAN (Stage 1) + 1x ESRGAN RaGAN (Stage 2)
+# ============================================================================
+
+if HAS_TORCH:
+
+    class UNetDownBlock(nn.Module):
+        """Downsampling block for the Stage 1 De-Glare U-Net."""
+
+        def __init__(
+            self,
+            in_channels: int,
+            out_channels: int,
+            normalize: bool = True,
+            dropout: float = 0.0,
+        ) -> None:
+            super().__init__()
+            layers: list[nn.Module] = [
+                nn.Conv2d(
+                    in_channels,
+                    out_channels,
+                    kernel_size=4,
+                    stride=2,
+                    padding=1,
+                    bias=not normalize,
+                )
+            ]
+            if normalize:
+                layers.append(nn.InstanceNorm2d(out_channels, affine=True))
+            layers.append(nn.LeakyReLU(0.2, inplace=True))
+            if dropout > 0.0:
+                layers.append(nn.Dropout(dropout))
+            self.model = nn.Sequential(*layers)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return self.model(x)
+
+    class UNetUpBlock(nn.Module):
+        """Upsampling block with skip connection for the Stage 1 De-Glare U-Net."""
+
+        def __init__(
+            self,
+            in_channels: int,
+            out_channels: int,
+            dropout: float = 0.0,
+        ) -> None:
+            super().__init__()
+            layers: list[nn.Module] = [
+                nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+                nn.Conv2d(
+                    in_channels,
+                    out_channels,
+                    kernel_size=3,
+                    stride=1,
+                    padding=1,
+                    bias=False,
+                ),
+                nn.InstanceNorm2d(out_channels, affine=True),
+                nn.ReLU(inplace=True),
+            ]
+            if dropout > 0.0:
+                layers.append(nn.Dropout(dropout))
+            self.model = nn.Sequential(*layers)
+
+        def forward(
+            self, x: torch.Tensor, skip_input: torch.Tensor
+        ) -> torch.Tensor:
+            x = self.model(x)
+            if x.shape[-2:] != skip_input.shape[-2:]:
+                x = F.interpolate(
+                    x,
+                    size=skip_input.shape[-2:],
+                    mode='bilinear',
+                    align_corners=False,
+                )
+            return torch.cat((x, skip_input), dim=1)
+
+    class DeGlareUNetGenerator(nn.Module):
+        """Specular-aware U-Net generator for Stage 1 de-glare & reflection removal."""
+
+        def __init__(self, in_channels: int = 3, base_channels: int = 64) -> None:
+            super().__init__()
+            self.down1 = UNetDownBlock(
+                in_channels + 1, base_channels, normalize=False
+            )
+            self.down2 = UNetDownBlock(base_channels, base_channels * 2)
+            self.down3 = UNetDownBlock(base_channels * 2, base_channels * 4)
+            self.down4 = UNetDownBlock(
+                base_channels * 4, base_channels * 8, dropout=0.2
+            )
+            self.down5 = UNetDownBlock(
+                base_channels * 8, base_channels * 8, dropout=0.2
+            )
+
+            self.up1 = UNetUpBlock(
+                base_channels * 8, base_channels * 8, dropout=0.2
+            )
+            self.up2 = UNetUpBlock(base_channels * 16, base_channels * 4)
+            self.up3 = UNetUpBlock(base_channels * 8, base_channels * 2)
+            self.up4 = UNetUpBlock(base_channels * 4, base_channels)
+
+            self.final_head = nn.Sequential(
+                nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+                nn.Conv2d(
+                    base_channels * 2, base_channels, kernel_size=3, padding=1
+                ),
+                nn.LeakyReLU(0.2, inplace=True),
+                nn.Conv2d(
+                    base_channels, in_channels + 1, kernel_size=3, padding=1
+                ),
+            )
+
+        @staticmethod
+        def compute_specular_prior(x: torch.Tensor) -> torch.Tensor:
+            rgb01 = (x + 1.0) * 0.5
+            max_c, _ = torch.max(rgb01, dim=1, keepdim=True)
+            min_c, _ = torch.min(rgb01, dim=1, keepdim=True)
+            saturation = (max_c - min_c) / (max_c + 1e-5)
+            return torch.clamp((max_c - 0.75) * 4.0, 0.0, 1.0) * (
+                1.0 - saturation
+            )
+
+        def forward(
+            self, x: torch.Tensor
+        ) -> Tuple[torch.Tensor, torch.Tensor]:
+            spec_prior = self.compute_specular_prior(x)
+            inp = torch.cat([x, spec_prior], dim=1)
+
+            d1 = self.down1(inp)
+            d2 = self.down2(d1)
+            d3 = self.down3(d2)
+            d4 = self.down4(d3)
+            d5 = self.down5(d4)
+
+            u1 = self.up1(d5, d4)
+            u2 = self.up2(u1, d3)
+            u3 = self.up3(u2, d2)
+            u4 = self.up4(u3, d1)
+
+            out = self.final_head(u4)
+            if out.shape[-2:] != x.shape[-2:]:
+                out = F.interpolate(
+                    out, size=x.shape[-2:], mode='bilinear', align_corners=False
+                )
+
+            residual_rgb = torch.tanh(out[:, :3, :, :])
+            reflection_mask = torch.sigmoid(out[:, 3:4, :, :])
+            deglared = torch.clamp(
+                x - reflection_mask * residual_rgb, -1.0, 1.0
+            )
+            reflection_layer = reflection_mask * ((residual_rgb + 1.0) * 0.5)
+            return deglared, reflection_layer
+
+    class PatchGANDiscriminator(nn.Module):
+        """Conditional Markovian PatchGAN discriminator for Stage 1 (Pix2Pix)."""
+
+        def __init__(self, in_channels: int = 3, base_channels: int = 64) -> None:
+            super().__init__()
+
+            def disc_block(
+                in_c: int, out_c: int, stride: int = 2, normalize: bool = True
+            ) -> list[nn.Module]:
+                layers: list[nn.Module] = [
+                    spectral_norm(
+                        nn.Conv2d(
+                            in_c, out_c, kernel_size=4, stride=stride, padding=1
+                        )
+                    )
+                ]
+                if normalize:
+                    layers.append(nn.InstanceNorm2d(out_c, affine=True))
+                layers.append(nn.LeakyReLU(0.2, inplace=True))
+                return layers
+
+            self.model = nn.Sequential(
+                *disc_block(in_channels * 2, base_channels, normalize=False),
+                *disc_block(base_channels, base_channels * 2),
+                *disc_block(base_channels * 2, base_channels * 4),
+                *disc_block(base_channels * 4, base_channels * 8, stride=1),
+                spectral_norm(
+                    nn.Conv2d(
+                        base_channels * 8, 1, kernel_size=4, stride=1, padding=1
+                    )
+                ),
+            )
+
+        def forward(
+            self, img_condition: torch.Tensor, img_target: torch.Tensor
+        ) -> torch.Tensor:
+            return self.model(torch.cat((img_condition, img_target), dim=1))
+
+    class ResidualDenseBlock(nn.Module):
+        """5-layer Residual Dense Block without Batch Normalization (ESRGAN)."""
+
+        def __init__(
+            self,
+            num_feat: int = 64,
+            num_grow_ch: int = 32,
+            res_scale: float = 0.2,
+        ) -> None:
+            super().__init__()
+            self.res_scale = res_scale
+            self.conv1 = nn.Conv2d(num_feat, num_grow_ch, 3, 1, 1)
+            self.conv2 = nn.Conv2d(num_feat + num_grow_ch, num_grow_ch, 3, 1, 1)
+            self.conv3 = nn.Conv2d(
+                num_feat + 2 * num_grow_ch, num_grow_ch, 3, 1, 1
+            )
+            self.conv4 = nn.Conv2d(
+                num_feat + 3 * num_grow_ch, num_grow_ch, 3, 1, 1
+            )
+            self.conv5 = nn.Conv2d(
+                num_feat + 4 * num_grow_ch, num_feat, 3, 1, 1
+            )
+            self.lrelu = nn.LeakyReLU(negative_slope=0.2, inplace=True)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            x1 = self.lrelu(self.conv1(x))
+            x2 = self.lrelu(self.conv2(torch.cat((x, x1), dim=1)))
+            x3 = self.lrelu(self.conv3(torch.cat((x, x1, x2), dim=1)))
+            x4 = self.lrelu(self.conv4(torch.cat((x, x1, x2, x3), dim=1)))
+            x5 = self.conv5(torch.cat((x, x1, x2, x3, x4), dim=1))
+            return x5 * self.res_scale + x
+
+    class RRDB(nn.Module):
+        """Residual-in-Residual Dense Block (Wang et al., ESRGAN 2018)."""
+
+        def __init__(
+            self,
+            num_feat: int = 64,
+            num_grow_ch: int = 32,
+            res_scale: float = 0.2,
+        ) -> None:
+            super().__init__()
+            self.res_scale = res_scale
+            self.rdb1 = ResidualDenseBlock(num_feat, num_grow_ch, res_scale)
+            self.rdb2 = ResidualDenseBlock(num_feat, num_grow_ch, res_scale)
+            self.rdb3 = ResidualDenseBlock(num_feat, num_grow_ch, res_scale)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            out = self.rdb1(x)
+            out = self.rdb2(out)
+            out = self.rdb3(out)
+            return out * self.res_scale + x
+
+    class ESRGAN1xGenerator(nn.Module):
+        """1x RRDB Generator for chrome micro-etching and prism line restoration."""
+
+        def __init__(
+            self,
+            in_channels: int = 3,
+            out_channels: int = 3,
+            num_feat: int = 64,
+            num_rrdb_blocks: int = 8,
+            num_grow_ch: int = 32,
+        ) -> None:
+            super().__init__()
+            self.conv_first = nn.Conv2d(in_channels, num_feat, 3, 1, 1)
+            self.body = nn.Sequential(
+                *[RRDB(num_feat, num_grow_ch) for _ in range(num_rrdb_blocks)]
+            )
+            self.conv_body = nn.Conv2d(num_feat, num_feat, 3, 1, 1)
+            self.conv_hr = nn.Conv2d(num_feat, num_feat, 3, 1, 1)
+            self.conv_last = nn.Conv2d(num_feat, out_channels, 3, 1, 1)
+            self.lrelu = nn.LeakyReLU(negative_slope=0.2, inplace=True)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            feat = self.conv_first(x)
+            body_feat = self.conv_body(self.body(feat))
+            feat = feat + body_feat
+            out = self.conv_last(self.lrelu(self.conv_hr(self.lrelu(feat))))
+            return torch.clamp(x + out, -1.0, 1.0)
+
+    class RaGANDiscriminator(nn.Module):
+        """Spectral-Normalized Discriminator for Relativistic Average GAN."""
+
+        def __init__(self, in_channels: int = 3, base_channels: int = 64) -> None:
+            super().__init__()
+
+            def sn_block(in_c: int, out_c: int, stride: int) -> nn.Sequential:
+                return nn.Sequential(
+                    spectral_norm(
+                        nn.Conv2d(
+                            in_c, out_c, kernel_size=3, stride=stride, padding=1
+                        )
+                    ),
+                    nn.LeakyReLU(0.2, inplace=True),
+                )
+
+            self.features = nn.Sequential(
+                sn_block(in_channels, base_channels, stride=1),
+                sn_block(base_channels, base_channels, stride=2),
+                sn_block(base_channels, base_channels * 2, stride=1),
+                sn_block(base_channels * 2, base_channels * 2, stride=2),
+                sn_block(base_channels * 2, base_channels * 4, stride=1),
+                sn_block(base_channels * 4, base_channels * 4, stride=2),
+                sn_block(base_channels * 4, base_channels * 8, stride=1),
+                sn_block(base_channels * 8, base_channels * 8, stride=2),
+                spectral_norm(
+                    nn.Conv2d(
+                        base_channels * 8, 1, kernel_size=3, stride=1, padding=1
+                    )
+                ),
+            )
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return self.features(x)
+
+    class RelativisticAverageGANLoss(nn.Module):
+        """Relativistic Average GAN (RaGAN) loss (Jolicoeur-Martineau, ICLR 2019)."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.bce_with_logits = nn.BCEWithLogitsLoss()
+
+        def discriminator_loss(
+            self, real_logits: torch.Tensor, fake_logits: torch.Tensor
+        ) -> torch.Tensor:
+            real_minus_fake = real_logits - torch.mean(
+                fake_logits, dim=0, keepdim=True
+            )
+            fake_minus_real = fake_logits - torch.mean(
+                real_logits, dim=0, keepdim=True
+            )
+            loss_real = self.bce_with_logits(
+                real_minus_fake, torch.ones_like(real_logits)
+            )
+            loss_fake = self.bce_with_logits(
+                fake_minus_real, torch.zeros_like(fake_logits)
+            )
+            return 0.5 * (loss_real + loss_fake)
+
+        def generator_loss(
+            self, real_logits: torch.Tensor, fake_logits: torch.Tensor
+        ) -> torch.Tensor:
+            real_minus_fake = real_logits - torch.mean(
+                fake_logits, dim=0, keepdim=True
+            )
+            fake_minus_real = fake_logits - torch.mean(
+                real_logits, dim=0, keepdim=True
+            )
+            loss_real = self.bce_with_logits(
+                real_minus_fake, torch.zeros_like(real_logits)
+            )
+            loss_fake = self.bce_with_logits(
+                fake_minus_real, torch.ones_like(fake_logits)
+            )
+            return 0.5 * (loss_real + loss_fake)
+
+    class ExclusionLoss(nn.Module):
+        """Gradient-domain Exclusion Loss (Zhang et al., CVPR 2018)."""
+
+        def __init__(self, levels: int = 3) -> None:
+            super().__init__()
+            self.levels = levels
+
+        @staticmethod
+        def compute_gradients(
+            img: torch.Tensor,
+        ) -> Tuple[torch.Tensor, torch.Tensor]:
+            grad_x = img[:, :, :, 1:] - img[:, :, :, :-1]
+            grad_y = img[:, :, 1:, :] - img[:, :, :-1, :]
+            return grad_x, grad_y
+
+        def forward(
+            self, transmission: torch.Tensor, reflection: torch.Tensor
+        ) -> torch.Tensor:
+            total_loss = torch.tensor(0.0, device=transmission.device)
+            t_cur = (transmission + 1.0) * 0.5
+            r_cur = reflection
+
+            for level in range(self.levels):
+                t_gx, t_gy = self.compute_gradients(t_cur)
+                r_gx, r_gy = self.compute_gradients(r_cur)
+
+                alpha_x = (
+                    torch.mean(torch.abs(t_gx))
+                    / (torch.mean(torch.abs(r_gx)) + 1e-6)
+                ).detach()
+                alpha_y = (
+                    torch.mean(torch.abs(t_gy))
+                    / (torch.mean(torch.abs(r_gy)) + 1e-6)
+                ).detach()
+
+                gx_prod = torch.tanh(torch.abs(t_gx)) * torch.tanh(
+                    alpha_x * torch.abs(r_gx)
+                )
+                gy_prod = torch.tanh(torch.abs(t_gy)) * torch.tanh(
+                    alpha_y * torch.abs(r_gy)
+                )
+                total_loss = (
+                    total_loss + torch.mean(gx_prod) + torch.mean(gy_prod)
+                )
+
+                if level < self.levels - 1 and min(t_cur.shape[-2:]) >= 4:
+                    t_cur = F.avg_pool2d(t_cur, kernel_size=2, stride=2)
+                    r_cur = F.avg_pool2d(r_cur, kernel_size=2, stride=2)
+
+            return total_loss / self.levels
+
+    class PreActivationFeatureLoss(nn.Module):
+        """Pre-activation high-frequency Sobel/Laplacian edge loss."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            sobel_x = torch.tensor(
+                [[[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]]
+            ).unsqueeze(0)
+            sobel_y = torch.tensor(
+                [[[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]]]
+            ).unsqueeze(0)
+            laplacian = torch.tensor(
+                [[[0.0, -1.0, 0.0], [-1.0, 4.0, -1.0], [0.0, -1.0, 0.0]]]
+            ).unsqueeze(0)
+            self.register_buffer(
+                'kernels', torch.cat([sobel_x, sobel_y, laplacian], dim=0)
+            )
+
+        def forward(
+            self, pred: torch.Tensor, target: torch.Tensor
+        ) -> torch.Tensor:
+            b, c, h, w = pred.shape
+            feat_pred = F.conv2d(
+                pred.reshape(b * c, 1, h, w), self.kernels, padding=1
+            )
+            feat_target = F.conv2d(
+                target.reshape(b * c, 1, h, w), self.kernels, padding=1
+            )
+            return F.l1_loss(feat_pred, feat_target)
+
+    @dataclass
+    class RestorationWeights:
+        lambda_l1_stage1: float = 10.0
+        lambda_patchgan: float = 0.1
+        lambda_exclusion: float = 0.5
+        lambda_l1_stage2: float = 1.0
+        lambda_perceptual: float = 1.0
+        lambda_ragan: float = 0.005
+
+    class ChromeScannerRestorationPipeline(nn.Module):
+        """Chained Stage 1 (PatchGAN De-Glare) -> Stage 2 (1x ESRGAN RaGAN) model."""
+
+        def __init__(
+            self,
+            base_channels: int = 64,
+            num_rrdb_blocks: int = 8,
+            weights: Optional[RestorationWeights] = None,
+        ) -> None:
+            super().__init__()
+            self.weights = weights or RestorationWeights()
+            self.deglare_G = DeGlareUNetGenerator(
+                in_channels=3, base_channels=base_channels
+            )
+            self.patch_D = PatchGANDiscriminator(
+                in_channels=3, base_channels=base_channels
+            )
+            self.esrgan_G = ESRGAN1xGenerator(
+                in_channels=3,
+                out_channels=3,
+                num_feat=base_channels,
+                num_rrdb_blocks=num_rrdb_blocks,
+            )
+            self.ragan_D = RaGANDiscriminator(
+                in_channels=3, base_channels=base_channels
+            )
+
+            self.mse_loss = nn.MSELoss()
+            self.l1_loss = nn.L1Loss()
+            self.exclusion_loss = ExclusionLoss(levels=3)
+            self.ragan_loss = RelativisticAverageGANLoss()
+            self.perceptual_loss = PreActivationFeatureLoss()
+
+        def forward(
+            self, degraded_scan: torch.Tensor
+        ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            deglared, reflection_layer = self.deglare_G(degraded_scan)
+            restored = self.esrgan_G(deglared)
+            return restored, deglared, reflection_layer
+
+        def train_step(
+            self,
+            degraded_scan: torch.Tensor,
+            clean_target: torch.Tensor,
+            opt_G: torch.optim.Optimizer,
+            opt_D: torch.optim.Optimizer,
+        ) -> Dict[str, float]:
+            for p in self.patch_D.parameters():
+                p.requires_grad = False
+            for p in self.ragan_D.parameters():
+                p.requires_grad = False
+
+            opt_G.zero_grad()
+            restored, deglared, reflection_layer = self.forward(degraded_scan)
+
+            pred_patch_fake = self.patch_D(degraded_scan, deglared)
+            loss_s1_l1 = self.l1_loss(deglared, clean_target)
+            loss_s1_adv = self.mse_loss(
+                pred_patch_fake, torch.ones_like(pred_patch_fake)
+            )
+            loss_s1_excl = self.exclusion_loss(deglared, reflection_layer)
+
+            real_logits = self.ragan_D(clean_target).detach()
+            fake_logits = self.ragan_D(restored)
+            loss_s2_l1 = self.l1_loss(restored, clean_target)
+            loss_s2_perc = self.perceptual_loss(restored, clean_target)
+            loss_s2_ragan = self.ragan_loss.generator_loss(
+                real_logits, fake_logits
+            )
+
+            total_G_loss = (
+                self.weights.lambda_l1_stage1 * loss_s1_l1
+                + self.weights.lambda_patchgan * loss_s1_adv
+                + self.weights.lambda_exclusion * loss_s1_excl
+                + self.weights.lambda_l1_stage2 * loss_s2_l1
+                + self.weights.lambda_perceptual * loss_s2_perc
+                + self.weights.lambda_ragan * loss_s2_ragan
+            )
+            total_G_loss.backward()
+            opt_G.step()
+
+            for p in self.patch_D.parameters():
+                p.requires_grad = True
+            for p in self.ragan_D.parameters():
+                p.requires_grad = True
+
+            opt_D.zero_grad()
+            pred_patch_real = self.patch_D(degraded_scan, clean_target)
+            pred_patch_fake_d = self.patch_D(degraded_scan, deglared.detach())
+            loss_D_patch = 0.5 * (
+                self.mse_loss(pred_patch_real, torch.ones_like(pred_patch_real))
+                + self.mse_loss(
+                    pred_patch_fake_d, torch.zeros_like(pred_patch_fake_d)
+                )
+            )
+
+            real_logits_d = self.ragan_D(clean_target)
+            fake_logits_d = self.ragan_D(restored.detach())
+            loss_D_ragan = self.ragan_loss.discriminator_loss(
+                real_logits_d, fake_logits_d
+            )
+
+            total_D_loss = loss_D_patch + loss_D_ragan
+            total_D_loss.backward()
+            opt_D.step()
+
+            return {
+                'loss_G_total': float(total_G_loss.item()),
+                'loss_s1_l1': float(loss_s1_l1.item()),
+                'loss_s1_excl': float(loss_s1_excl.item()),
+                'loss_s2_l1': float(loss_s2_l1.item()),
+                'loss_s2_perc': float(loss_s2_perc.item()),
+                'loss_s2_ragan': float(loss_s2_ragan.item()),
+                'loss_D_patch': float(loss_D_patch.item()),
+                'loss_D_ragan': float(loss_D_ragan.item()),
+            }
+
+        @torch.no_grad()
+        def restore_tiled(
+            self,
+            degraded_scan: torch.Tensor,
+            tile_size: int = 256,
+            tile_overlap: int = 32,
+        ) -> torch.Tensor:
+            self.eval()
+            b, c, h, w = degraded_scan.shape
+            if h <= tile_size and w <= tile_size:
+                restored, _, _ = self.forward(degraded_scan)
+                return restored
+
+            stride = tile_size - tile_overlap
+            output = torch.zeros_like(degraded_scan)
+            weight_map = torch.zeros((b, 1, h, w), device=degraded_scan.device)
+
+            for y in range(0, h, stride):
+                for x in range(0, w, stride):
+                    y_end = min(y + tile_size, h)
+                    x_end = min(x + tile_size, w)
+                    y_start = max(0, y_end - tile_size)
+                    x_start = max(0, x_end - tile_size)
+
+                    tile = degraded_scan[:, :, y_start:y_end, x_start:x_end]
+                    restored_tile, _, _ = self.forward(tile)
+                    output[:, :, y_start:y_end, x_start:x_end] += restored_tile
+                    weight_map[:, :, y_start:y_end, x_start:x_end] += 1.0
+
+            return output / torch.clamp(weight_map, min=1.0)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description='Chained Conditional PatchGAN De-Glare + 1x ESRGAN (RaGAN) Scanner Restoration.'
+    )
+    parser.add_argument(
+        '--self-test',
+        action='store_true',
+        help='Run verification pass on synthetic or sample card scans.',
+    )
+    parser.add_argument('--input-image', type=Path, help='Single scan path for 1x restoration.')
+    parser.add_argument('--output-image', type=Path, help='Output path for restored scan.')
+    parser.add_argument(
+        '--rotate-180',
+        action='store_true',
+        help='Rotate upside-down scans by 180 degrees during restoration.',
+    )
+    args = parser.parse_args()
+
+    if args.self_test:
+        if HAS_TORCH:
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            pipeline = ChromeScannerRestorationPipeline(
+                base_channels=16, num_rrdb_blocks=2
+            ).to(device)
+            opt_G = torch.optim.AdamW(
+                list(pipeline.deglare_G.parameters())
+                + list(pipeline.esrgan_G.parameters()),
+                lr=2e-4,
+            )
+            opt_D = torch.optim.AdamW(
+                list(pipeline.patch_D.parameters())
+                + list(pipeline.ragan_D.parameters()),
+                lr=2e-4,
+            )
+            deg = torch.randn(2, 3, 64, 64, device=device).clamp(-1.0, 1.0)
+            clean = torch.randn(2, 3, 64, 64, device=device).clamp(-1.0, 1.0)
+            metrics = pipeline.train_step(deg, clean, opt_G, opt_D)
+            print('PyTorch self-test metrics:', metrics)
+        else:
+            synth = np.full((256, 256, 3), 180, dtype=np.uint8)
+            synth[:, 165, :] = 40  # Simulated vertical CIS streak
+            restored, info = restore_scan_cv2(synth, rotate_180=True)
+            assert restored.shape == synth.shape
+            print('OpenCV fallback self-test passed:', info)
+        return
+
+    if args.input_image and args.output_image:
+        img_bgr = cv2.imread(str(args.input_image))
+        if img_bgr is None:
+            raise FileNotFoundError(f'Cannot read input image: {args.input_image}')
+        restored_bgr, info = restore_scan_cv2(
+            img_bgr, rotate_180=args.rotate_180, remove_streaks=True
+        )
+        args.output_image.parent.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(args.output_image), restored_bgr, [cv2.IMWRITE_JPEG_QUALITY, 96])
+        print(f'Saved restored 1x scan to {args.output_image} | {info}')
+        return
+
+    parser.print_help()
+
+
+if __name__ == '__main__':
+    main()

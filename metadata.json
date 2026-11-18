@@ -1,0 +1,8 @@
+{
+  "name": "Remix CardCrop AI Suite",
+  "description": "A professional batch sports card cropping tool featuring AI-powered image generation and an intelligent assistant.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
